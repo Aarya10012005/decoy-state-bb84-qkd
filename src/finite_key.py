@@ -1,64 +1,46 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 
-from .decoy_estimation import DecoyEstimates
-from .state_preparation import PreparedState
 from .channel import MeasurementResult
+from .decoy_estimation import (
+    DecoyEstimates,
+    IntensityCounts,
+    count_by_intensity,
+    decoy_bounds,
+)
+from .state_preparation import PreparedState
+
+# Number of one-sided bounds used in parameter estimation; eps is split
+# between them by a union bound.
+NUM_ESTIMATED_BOUNDS = 5
 
 
-@dataclass
-class FiniteKeyBounds:
-    gain_low: dict[str, float]
-    gain_high: dict[str, float]
-    qber_low: dict[str, float]
-    qber_high: dict[str, float]
+def chernoff_upper(count: int, eps: float) -> float:
+    """Upper bound on the expected value of a sum of independent Bernoulli
+    trials, given the observed count, holding except with probability eps.
+
+    Inverts P[X <= (1 - d) m] <= exp(-d^2 m / 2).
+    """
+    beta = np.log(1.0 / eps)
+    return count + beta + np.sqrt(beta**2 + 2.0 * beta * count)
 
 
-def _hoeffding_interval(p_hat: float, n: int, eps: float) -> tuple[float, float]:
-    if n <= 0:
+def chernoff_lower(count: int, eps: float) -> float:
+    """Lower bound counterpart of `chernoff_upper`.
+
+    Inverts P[X >= (1 + d) m] <= exp(-d^2 m / (2 + d)).
+    """
+    beta = np.log(1.0 / eps)
+    return max(0.0, count - (np.sqrt(beta**2 + 8.0 * beta * count) - beta) / 2.0)
+
+
+def _rate_interval(count: int, trials: int, eps: float) -> tuple[float, float]:
+    if trials <= 0:
         return 0.0, 1.0
-    delta = np.sqrt(np.log(1.0 / eps) / (2.0 * n))
-    return max(0.0, p_hat - delta), min(1.0, p_hat + delta)
-
-
-def _estimate_bounds(
-    prepared: PreparedState,
-    measured: MeasurementResult,
-    eps: float,
-) -> FiniteKeyBounds:
-    labels = ("signal", "decoy", "vacuum")
-    gain_low: dict[str, float] = {}
-    gain_high: dict[str, float] = {}
-    qber_low: dict[str, float] = {}
-    qber_high: dict[str, float] = {}
-
-    same_basis = measured.bob_bases == prepared.bases
-
-    for label in labels:
-        mask = prepared.intensities == label
-        n_total = int(mask.sum())
-        clicks = int(measured.clicks[mask].sum())
-        q_hat = clicks / n_total if n_total > 0 else 0.0
-        gain_low[label], gain_high[label] = _hoeffding_interval(q_hat, n_total, eps)
-
-        sifted = mask & measured.clicks & same_basis
-        n_sifted = int(sifted.sum())
-        if n_sifted > 0:
-            errors = int((measured.bob_bits[sifted] != prepared.bits[sifted]).sum())
-            e_hat = errors / n_sifted
-        else:
-            e_hat = 0.0
-        qber_low[label], qber_high[label] = _hoeffding_interval(e_hat, n_sifted, eps)
-
-    return FiniteKeyBounds(
-        gain_low=gain_low,
-        gain_high=gain_high,
-        qber_low=qber_low,
-        qber_high=qber_high,
-    )
+    low = chernoff_lower(count, eps) / trials
+    high = min(1.0, chernoff_upper(count, eps) / trials)
+    return low, high
 
 
 def estimate_decoy_parameters_finite(
@@ -68,42 +50,41 @@ def estimate_decoy_parameters_finite(
     mu_decoy: float,
     eps: float,
 ) -> DecoyEstimates:
-    bounds = _estimate_bounds(prepared, measured, eps)
+    """Finite-size decoy estimates with multiplicative Chernoff bounds.
 
-    mu = mu_signal
-    nu = mu_decoy
-    exp_mu = np.exp(mu)
-    exp_nu = np.exp(nu)
+    `gain` and `qber` hold the observed values (they set the error-correction
+    leakage, which is what is actually disclosed); Y0, Y1 and e1 are bounded.
+    """
+    counts = count_by_intensity(prepared, measured)
+    return finite_estimates_from_counts(counts, mu_signal, mu_decoy, eps)
 
-    q_mu_high = bounds.gain_high["signal"]
-    q_nu_low = bounds.gain_low["decoy"]
-    q_nu_high = bounds.gain_high["decoy"]
-    y0_high = bounds.gain_high["vacuum"]
 
-    denom = mu * nu - nu**2
-    if denom <= 0:
-        y1_lower = 0.0
-    else:
-        y1_lower = (
-            mu
-            / denom
-            * (
-                q_nu_low * exp_nu
-                - q_mu_high * exp_mu * (nu**2 / mu**2)
-                - (mu**2 - nu**2) / mu**2 * y0_high
-            )
-        )
-        y1_lower = max(0.0, y1_lower)
+def finite_estimates_from_counts(
+    counts: dict[str, IntensityCounts], mu_signal: float, mu_decoy: float, eps: float
+) -> DecoyEstimates:
+    """Finite-size decoy bounds from per-intensity counts (observed, or expected
+    counts when used as a deterministic model in `src.theory`)."""
+    eps_each = eps / NUM_ESTIMATED_BOUNDS
 
-    e0 = 0.5
-    e_nu_high = bounds.qber_high["decoy"]
-    if y1_lower <= 0:
-        e1_upper = 1.0
-    else:
-        e1_upper = (e_nu_high * q_nu_high * exp_nu - e0 * y0_high) / (nu * y1_lower)
-        e1_upper = min(max(e1_upper, 0.0), 1.0)
+    signal, decoy, vacuum = counts["signal"], counts["decoy"], counts["vacuum"]
+    _, q_mu_high = _rate_interval(signal.clicks, signal.pulses, eps_each)
+    q_nu_low, _ = _rate_interval(decoy.clicks, decoy.pulses, eps_each)
+    y0_low, y0_high = _rate_interval(vacuum.clicks, vacuum.pulses, eps_each)
+    _, eq_nu_high = _rate_interval(decoy.errors, decoy.matched_pulses, eps_each)
 
-    gain = {k: bounds.gain_low[k] for k in ("signal", "decoy", "vacuum")}
-    qber = {k: bounds.qber_high[k] for k in ("signal", "decoy", "vacuum")}
+    y1_lower, e1_upper = decoy_bounds(
+        mu_signal,
+        mu_decoy,
+        q_mu_high=q_mu_high,
+        q_nu_low=q_nu_low,
+        y0_high=y0_high,
+        y0_low=y0_low,
+        eq_nu_high=eq_nu_high,
+    )
 
-    return DecoyEstimates(gain=gain, qber=qber, y1_lower=y1_lower, e1_upper=e1_upper)
+    gain = {label: c.gain for label, c in counts.items()}
+    qber = {label: c.qber for label, c in counts.items()}
+
+    return DecoyEstimates(
+        gain=gain, qber=qber, y0_lower=y0_low, y1_lower=y1_lower, e1_upper=e1_upper
+    )

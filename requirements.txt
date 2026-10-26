@@ -1,0 +1,6 @@
+numpy>=1.24
+matplotlib>=3.7
+scipy>=1.10
+# Only needed for src/qiskit_bb84.py
+qiskit>=1.0
+qiskit-aer>=0.14

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
 
 import numpy as np
 
 from .config import QKDConfig
+
+INTENSITY_LABELS = ("signal", "decoy", "vacuum")
 
 
 @dataclass
@@ -28,13 +29,15 @@ def _choose_intensities(
     rng: np.random.Generator,
 ) -> np.ndarray:
     probs = [intensity_prob_signal, intensity_prob_decoy, intensity_prob_vacuum]
-    return rng.choice(["signal", "decoy", "vacuum"], size=num_rounds, p=probs)
+    return rng.choice(np.array(INTENSITY_LABELS), size=num_rounds, p=probs)
 
 
 def _sample_photon_numbers(
-    intensities: np.ndarray, mu_map: Dict[str, float], rng: np.random.Generator
+    intensities: np.ndarray, mu_map: dict[str, float], rng: np.random.Generator
 ) -> np.ndarray:
-    mu_values = np.vectorize(mu_map.get)(intensities)
+    mu_values = np.zeros(intensities.size, dtype=float)
+    for label, mu in mu_map.items():
+        mu_values[intensities == label] = mu
     return rng.poisson(mu_values)
 
 
@@ -51,12 +54,7 @@ def prepare_states(config: QKDConfig, seed: int | None = None) -> PreparedState:
         config.intensity_prob_vacuum,
         rng,
     )
-    mu_map = {
-        "signal": config.mu_signal,
-        "decoy": config.mu_decoy,
-        "vacuum": config.mu_vacuum,
-    }
-    photon_numbers = _sample_photon_numbers(intensities, mu_map, rng)
+    photon_numbers = _sample_photon_numbers(intensities, config.mu_map(), rng)
 
     return PreparedState(
         bits=bits,
